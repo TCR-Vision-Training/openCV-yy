@@ -1,1 +1,153 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
 
+using namespace cv;
+using namespace std;
+
+
+int main()
+{
+    // 读取图片
+    Mat img = imread("../images/picture1.png");
+
+    if(img.empty())
+    {
+        cout << "图片读取失败" << endl;
+        return -1;
+    }
+
+
+    // 转灰度
+    Mat gray;
+    cvtColor(img, gray, COLOR_BGR2GRAY);
+
+
+    // 二值化
+    Mat binary;
+    threshold(gray, binary, 200, 255, THRESH_BINARY_INV);
+
+
+    // 查找轮廓
+    vector<vector<Point>> contours;
+    vector<Vec4i> hierarchy;
+
+    findContours(binary,
+                 contours,
+                 hierarchy,
+                 RETR_EXTERNAL,
+                 CHAIN_APPROX_SIMPLE);
+
+
+
+    int circleCount = 0;
+    int rectCount = 0;
+    int triCount = 0;
+
+
+    for(int i = 0; i < contours.size(); i++)
+    {
+
+        // 计算轮廓面积
+        double area = contourArea(contours[i]);
+
+        // 去除小噪声
+        if(area < 500)
+            continue;
+
+
+        // 多边形拟合
+        vector<Point> approx;
+
+        approxPolyDP(contours[i],
+                     approx,
+                     0.04 * arcLength(contours[i], true),
+                     true);
+
+
+
+        string name;
+
+
+        // 三角形
+        if(approx.size() == 3)
+        {
+            triCount++;
+            name = "T" + to_string(triCount);
+        }
+
+
+        // 矩形
+        else if(approx.size() == 4)
+        {
+            rectCount++;
+            name = "R" + to_string(rectCount);
+        }
+
+
+        // 圆形
+        else
+        {
+            circleCount++;
+            name = "C" + to_string(circleCount);
+        }
+
+
+
+        // 画轮廓
+        drawContours(img,
+                     contours,
+                     i,
+                     Scalar(0,255,0),
+                     3);
+
+
+
+        // 求中心位置
+        Moments M = moments(contours[i]);
+
+        int cx = M.m10 / M.m00;
+        int cy = M.m01 / M.m00;
+
+
+
+        // 标注
+        putText(img,
+                name,
+                Point(cx-20,cy),
+                FONT_HERSHEY_SIMPLEX,
+                1,
+                Scalar(0,0,0),
+                2);
+
+    }
+
+
+
+    cout << "Circles: "
+         << circleCount << endl;
+
+    cout << "Rectangles: "
+         << rectCount << endl;
+
+    cout << "Triangles: "
+         << triCount << endl;
+
+
+
+    // 保存结果
+    imwrite("result.png", img);
+
+
+
+    // 缩小显示
+    Mat show;
+    resize(img, show, Size(800,600));
+
+
+    imshow("result", show);
+
+
+    waitKey(0);
+
+    return 0;
+}	
