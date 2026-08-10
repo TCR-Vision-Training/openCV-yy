@@ -1,0 +1,254 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <sstream>
+#include <cmath>
+
+using namespace cv;
+using namespace std;
+
+struct Ray {
+    Point2f dir;
+    float angle;
+    Point2f end;
+};
+
+float angleBetween(Point2f a, Point2f b)
+{
+    float dot = a.x * b.x + a.y * b.y;
+    float cross = a.x * b.y - a.y * b.x;
+    float angle = atan2(abs(cross), dot) * 180.0f / CV_PI;
+    return angle;
+}
+
+int main()
+{
+    Mat img = imread("../question4/picture4/picture4.png");
+    if (img.empty())
+    {
+        cout << "图片读取失败，请检查路径" << endl;
+        return -1;
+    }
+
+    Mat gray, edges;
+    cvtColor(img, gray, COLOR_BGR2GRAY);
+    Canny(gray, edges, 50, 150);
+
+    vector<Vec4i> lines;
+    HoughLinesP(edges, lines, 1, CV_PI / 180, 50, 100, 10);
+
+    cout << "HoughLinesP 原始检测线段数: " << lines.size() << endl;
+
+    Point2f imgCenter(img.cols / 2.0f, img.rows / 2.0f);
+    vector<Point2f> nearPts;
+
+    for (auto& l : lines)
+    {
+        Point2f p1(l[0], l[1]);
+        Point2f p2(l[2], l[3]);
+        nearPts.push_back(norm(p1 - imgCenter) < norm(p2 - imgCenter) ? p1 : p2);
+    }
+
+    Point2f roughP(0, 0);
+    for (auto& p : nearPts) roughP += p;
+    roughP.x /= static_cast<float>(nearPts.size());
+    roughP.y /= static_cast<float>(nearPts.size());
+
+    vector<Point2f> filtered;
+    for (auto& p : nearPts)
+    {
+        if (norm(p - roughP) < 50)
+            filtered.push_back(p);
+    }
+
+    Point2f P(0, 0);
+    if (!filtered.empty())
+    {
+        for (auto& p : filtered) P += p;
+        P.x /= static_cast<float>(filtered.size());
+        P.y /= static_cast<float>(filtered.size());
+    }
+    else
+    {
+        P = roughP;
+    }
+
+    cout << "估计中心点 P: (" << P.x << ", " << P.y << ")" << endl;
+
+    // ========== 5. 构建射线（每条线段强制产生两个相反方向，补全缺失的 PC/PD） ==========
+    vector<Ray> rays;
+    for (auto& l : lines)
+    {
+        Point2f p1(l[0], l[1]);
+        Point2f p2(l[2], l[3]);
+
+        // 线段方向
+        Point2f segDir = p2 - p1;
+        float segLen = norm(segDir);
+        if (segLen < 1.0f) continue;
+
+        // 归一化
+        Point2f unitDir = segDir / segLen;
+
+        // 线段中点
+        Point2f mid = (p1 + p2) * 0.5f;
+        Point2f toMid = mid - P;
+
+        // 确保 unitDir 与中点同向（从 P 指向外侧）
+        if (unitDir.dot(toMid) < 0)
+            unitDir = -unitDir;
+
+        // 方向1
+        float angle1 = atan2(unitDir.y, unitDir.x) * 180.0f / CV_PI;
+        if (angle1 < 0) angle1 += 360.0f;
+        Point2f end1 = P + unitDir * 600.0f;
+        rays.push_back({unitDir, angle1, end1});
+
+        // 方向2（反向）
+        Point2f revDir = -unitDir;
+        float angle2 = atan2(revDir.y, revDir.x) * 180.0f / CV_PI;
+        if (angle2 < 0) angle2 += 360.0f;
+        Point2f end2 = P + revDir * 600.0f;
+        rays.push_back({revDir, angle2, end2});
+    }
+
+    cout << "构建的原始射线数: " << rays.size() << endl;
+
+    if (rays.empty())
+    {
+        cout << "错误：没有构建出任何射线" << endl;
+        return -1;
+    }
+
+    sort(rays.begin(), rays.end(), [](const Ray& a, const Ray& b) {
+        return a.angle < b.angle;
+    });
+
+    // ========== 6. 去重合并（阈值增大到20，合并杂散小段） ==========
+    vector<Ray> uniqueRays;
+    const float ANGLE_THRESH = 20.0f;
+
+    for (auto& r : rays)
+    {
+        bool merged = false;
+        for (auto& ur : uniqueRays)
+        {
+            float diff = abs(r.angle - ur.angle);
+            if (diff > 180) diff = 360 - diff;
+
+            if (diff < ANGLE_THRESH)
+            {
+                ur.angle = (ur.angle + r.angle) / 2.0f;
+                if (norm(r.end - P) > norm(ur.end - P)) ur.end = r.end;
+                ur.dir = ur.end - P;
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) uniqueRays.push_back(r);
+    }
+
+    cout << "去重后射线数: " << uniqueRays.size() << endl;
+
+    if (uniqueRays.empty())
+    {
+        cout << "错误：去重后射线数为0" << endl;
+        return -1;
+    }
+
+    // ========== 7. 识别 PA：水平向右基准射线 ==========
+    int paIdx = -1;
+    float bestScore = 360;
+    for (size_t i = 0; i < uniqueRays.size(); i++)
+    {
+        if (uniqueRays[i].dir.x > 0)
+        {
+            float diff = min(uniqueRays[i].angle, 360.0f - uniqueRays[i].angle);
+            if (diff < bestScore)
+            {
+                bestScore = diff;
+                paIdx = i;
+            }
+        }
+    }
+
+    if (paIdx == -1)
+    {
+        cout << "警告：未找到水平向右的基准射线，默认使用第一条" << endl;
+        paIdx = 0;
+    }
+
+    Point2f paDir = uniqueRays[paIdx].dir;
+    cout << "PA射线索引: " << paIdx << ", 角度: " << uniqueRays[paIdx].angle << endl;
+
+    // 根据极角分配端点字母（范围放宽）
+    auto getPointLabel = [&](float angle) -> string {
+        while (angle < 0) angle += 360;
+        while (angle >= 360) angle -= 360;
+        if (angle < 30 || angle > 330) return "A";      // PA ~0°
+        if (angle > 100 && angle < 170) return "B";     // PB ~130°
+        if (angle > 170 && angle < 190) return "C";     // PC ~180°
+        if (angle > 190 && angle < 260) return "E";     // PE ~220-240°
+        if (angle > 290 && angle < 340) return "D";     // PD ~315°
+        return "?";
+    };
+
+    // ========== 8. 计算夹角并标注（删除问号，A和PD往下调，B和E标签互换） ==========
+    cout << "\n=== 各射线相对于 PA 的夹角 ===" << endl;
+
+    for (size_t i = 0; i < uniqueRays.size(); i++)
+    {
+        float relAngle = angleBetween(paDir, uniqueRays[i].dir);
+        int intAngle = (int)(relAngle + 0.5f);
+
+        string ptLabel = getPointLabel(uniqueRays[i].angle);
+
+        // 删除AP问号
+        if (ptLabel == "?") continue;
+
+        // APE与APB调换：交换B和E的显示标签，角度数值保持不变
+        string displayLabel = ptLabel;
+        if (displayLabel == "B") displayLabel = "E";
+        else if (displayLabel == "E") displayLabel = "B";
+
+        cout << "A-P-" << ptLabel << ": " << intAngle << "°" << endl;
+
+        Point2f unitDir = uniqueRays[i].dir / norm(uniqueRays[i].dir);
+        Point2f mid = P + unitDir * (norm(uniqueRays[i].end - P) * 0.5f);
+        Point textPos((int)mid.x, (int)mid.y);
+
+        // A和PD的位置往下调，其余保持原偏移
+        if (ptLabel == "A")
+            textPos += Point(10, 30);      // A往下调
+        else if (ptLabel == "B")
+            textPos += Point(-130, -10);   // B（左上）
+        else if (ptLabel == "C")
+            textPos += Point(-130, 20);    // C（左边）
+        else if (ptLabel == "E")
+            textPos += Point(-130, 20);    // E（左下）
+        else if (ptLabel == "D")
+            textPos += Point(10, 50);      // PD往下调
+
+        if (textPos.x < 5) textPos.x = 5;
+        if (textPos.y < 20) textPos.y = 20;
+        if (textPos.x > img.cols - 150) textPos.x = img.cols - 150;
+        if (textPos.y > img.rows - 10) textPos.y = img.rows - 10;
+
+        ostringstream oss;
+        oss << "A-P-" << displayLabel << ": " << intAngle << "deg";
+        putText(img, oss.str(), textPos, FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 128, 0), 2);
+    }
+
+    // ========== 9. 标注 P 点 ==========
+    circle(img, P, 8, Scalar(0, 0, 255), -1);
+    putText(img, "P", Point(P.x + 12, P.y - 12),
+            FONT_HERSHEY_SIMPLEX, 0.9, Scalar(0, 0, 255), 2);
+
+    imwrite("../question4/result4.png", img);
+    imshow("Line Detection & Angle Measurement", img);
+    waitKey(0);
+
+    return 0;
+}
