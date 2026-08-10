@@ -1,0 +1,312 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/calib3d.hpp>
+#include <iostream>
+#include <vector>
+#include <cmath>
+
+class ChessboardDetector {
+private:
+    cv::Mat image;
+    cv::Mat displayImage;
+    std::vector<cv::Point2f> cornerPoints;
+    cv::Size patternSize;
+    float squareSizeMM;
+    float pixelToMMRatio;
+
+    // 干扰物过滤相关
+    cv::Mat mask;
+
+public:
+    ChessboardDetector(const std::string& imagePath, int cornersX = 8, int cornersY = 12, float squareMM = 5.0f)
+        : patternSize(cornersX, cornersY), squareSizeMM(squareMM), pixelToMMRatio(0.0f) {
+
+        // 读取图像
+        image = cv::imread(imagePath);
+        if (image.empty()) {
+            std::cerr << "无法读取图像: " << imagePath << std::endl;
+            return;
+        }
+
+        displayImage = image.clone();
+        mask = cv::Mat::ones(image.size(), CV_8U) * 255;
+    }
+
+    // 步骤1: 检测并过滤干扰物
+    bool filterDistractors() {
+        cv::Mat hsv;
+        cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
+
+        // 检测红色干扰物（圆形）
+        cv::Mat redMask1, redMask2;
+        cv::inRange(hsv, cv::Scalar(0, 100, 100), cv::Scalar(10, 255, 255), redMask1);
+        cv::inRange(hsv, cv::Scalar(160, 100, 100), cv::Scalar(179, 255, 255), redMask2);
+        cv::Mat redMask = redMask1 | redMask2;
+
+        // 检测绿色干扰物（矩形）
+        cv::Mat greenMask;
+        cv::inRange(hsv, cv::Scalar(35, 100, 100), cv::Scalar(85, 255, 255), greenMask);
+
+        // 形态学操作去除噪声
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+        cv::morphologyEx(redMask, redMask, cv::MORPH_OPEN, kernel);
+        cv::morphologyEx(greenMask, greenMask, cv::MORPH_OPEN, kernel);
+
+        // 查找红色干扰物的轮廓
+        std::vector<std::vector<cv::Point>> redContours;
+        cv::findContours(redMask, redContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        // 标记红色干扰物（圆形）
+        for (const auto& contour : redContours) {
+            if (contour.size() > 5) {
+                double area = cv::contourArea(contour);
+                if (area > 100) {  // 过滤小噪点
+                    // 使用Hough圆检测来确认是圆形
+                    std::vector<cv::Vec3f> circles;
+                    cv::Mat gray;
+                    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+                    cv::HoughCircles(gray, circles, cv::HOUGH_GRADIENT, 1, 20, 50, 30, 10, 50);
+
+                    for (const auto& circle : circles) {
+                        cv::Point center(cvRound(circle[0]), cvRound(circle[1]));
+                        int radius = cvRound(circle[2]);
+                        // 在掩码中排除红色圆形区域
+                        cv::circle(mask, center, radius + 5, 0, -1);
+                        cv::circle(displayImage, center, radius, cv::Scalar(0, 0, 255), 2);
+                        cv::putText(displayImage, "Red Circle",
+                                   cv::Point(center.x - 30, center.y - radius - 10),
+                                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
+                    }
+                }
+            }
+        }
+
+        // 查找绿色干扰物的轮廓
+        std::vector<std::vector<cv::Point>> greenContours;
+        cv::findContours(greenMask, greenContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        // 标记绿色干扰物（矩形）
+        for (const auto& contour : greenContours) {
+            if (contour.size() > 5) {
+                double area = cv::contourArea(contour);
+                if (area > 100) {
+                    // 获取旋转矩形
+                    cv::RotatedRect rect = cv::minAreaRect(contour);
+                    cv::Point2f vertices[4];
+                    rect.points(vertices);
+
+                    // 在掩码中排除绿色矩形区域
+                    std::vector<cv::Point> rectPoints;
+                    for (int i = 0; i < 4; i++) {
+                        rectPoints.push_back(vertices[i]);
+                    }
+                    cv::fillPoly(mask, std::vector<std::vector<cv::Point>>{rectPoints}, 0);
+
+                    // 绘制绿色矩形
+                    for (int i = 0; i < 4; i++) {
+                        cv::line(displayImage, vertices[i], vertices[(i+1)%4], cv::Scalar(0, 255, 0), 2);
+                    }
+                    cv::putText(displayImage, "Green Rectangle",
+                               cv::Point(rect.center.x - 30, rect.center.y - 30),
+                               cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+                }
+            }
+        }
+
+        return true;
+    }
+
+    // 步骤2: 检测棋盘格角点
+    bool detectChessboardCorners() {
+        cv::Mat gray;
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+
+        // 应用掩码，只检测棋盘格区域
+        cv::Mat maskedGray;
+        gray.copyTo(maskedGray, mask);
+
+        // 检测棋盘格角点
+        bool found = cv::findChessboardCorners(maskedGray, patternSize, cornerPoints,
+                                               cv::CALIB_CB_ADAPTIVE_THRESH |
+                                               cv::CALIB_CB_NORMALIZE_IMAGE);
+
+        if (found) {
+            // 亚像素精确定位
+            cv::cornerSubPix(maskedGray, cornerPoints, cv::Size(11, 11), cv::Size(-1, -1),
+                             cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 30, 0.001));
+
+            // 绘制角点
+            cv::drawChessboardCorners(displayImage, patternSize, cornerPoints, found);
+
+            // 标注角点序号（红色字体）
+            for (size_t i = 0; i < cornerPoints.size(); i++) {
+                cv::circle(displayImage, cornerPoints[i], 3, cv::Scalar(0, 0, 255), -1);
+                std::string text = std::to_string(i);
+                cv::putText(displayImage, text,
+                           cv::Point(cornerPoints[i].x + 5, cornerPoints[i].y - 5),
+                           cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(0, 0, 255), 1);
+            }
+        }
+
+        return found;
+    }
+
+    // 步骤3: 计算方格像素尺寸和物理尺寸比例
+    bool calculateSquareSize() {
+        if (cornerPoints.size() < 4) {
+            std::cerr << "角点数量不足" << std::endl;
+            return false;
+        }
+
+        std::vector<float> squareWidths, squareHeights;
+
+        // 计算每个方格的尺寸
+        for (int row = 0; row < patternSize.height - 1; row++) {
+            for (int col = 0; col < patternSize.width - 1; col++) {
+                int idx = row * patternSize.width + col;
+                int idxRight = idx + 1;
+                int idxBottom = idx + patternSize.width;
+                int idxBottomRight = idxBottom + 1;
+
+                // 计算方格宽度（顶部边）
+                float width = cv::norm(cornerPoints[idx] - cornerPoints[idxRight]);
+                // 计算方格高度（左侧边）
+                float height = cv::norm(cornerPoints[idx] - cornerPoints[idxBottom]);
+
+                // 使用底部的边和右侧的边进行验证
+                float width2 = cv::norm(cornerPoints[idxBottom] - cornerPoints[idxBottomRight]);
+                float height2 = cv::norm(cornerPoints[idxRight] - cornerPoints[idxBottomRight]);
+
+                // 取平均值
+                squareWidths.push_back((width + width2) / 2.0f);
+                squareHeights.push_back((height + height2) / 2.0f);
+            }
+        }
+
+        // 计算平均方格像素尺寸
+        float avgWidth = 0.0f, avgHeight = 0.0f;
+        for (float w : squareWidths) avgWidth += w;
+        for (float h : squareHeights) avgHeight += h;
+        avgWidth /= squareWidths.size();
+        avgHeight /= squareHeights.size();
+
+        float avgSquareSizePixels = (avgWidth + avgHeight) / 2.0f;
+
+        // 计算像素-物理尺寸比例 (px/mm)
+        pixelToMMRatio = avgSquareSizePixels / squareSizeMM;
+
+        // 输出结果
+        std::cout << "========== 方格尺寸分析 ==========" << std::endl;
+        std::cout << "平均方格像素宽度: " << avgWidth << " px" << std::endl;
+        std::cout << "平均方格像素高度: " << avgHeight << " px" << std::endl;
+        std::cout << "平均方格像素尺寸: " << avgSquareSizePixels << " px" << std::endl;
+        std::cout << "物理方格尺寸: " << squareSizeMM << " mm" << std::endl;
+        std::cout << "像素-物理比例: " << pixelToMMRatio << " px/mm" << std::endl;
+    
+
+        // 在图像上显示信息 - 全部使用红色字体
+        int expectedCorners = patternSize.width * patternSize.height;
+
+        // 显示角点数量（红色字体）
+        std::string cornerInfo = "Corners: " + std::to_string(cornerPoints.size()) +
+                                 " (expected: " + std::to_string(expectedCorners) + ")";
+        cv::putText(displayImage, cornerInfo, cv::Point(30, 30),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 255), 2);
+
+        // 显示方格尺寸（红色字体）
+        std::string sizeInfo = "Square size: " + std::to_string(avgSquareSizePixels) +
+                              " px (" + std::to_string(squareSizeMM) + " mm)";
+        cv::putText(displayImage, sizeInfo, cv::Point(30, 60),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 255), 2);
+
+        // 显示像素-物理比例（红色字体）
+        std::string ratioInfo = "Ratio: " + std::to_string(pixelToMMRatio) + " px/mm";
+        cv::putText(displayImage, ratioInfo, cv::Point(30, 90),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 255), 2);
+
+        return true;
+    }
+
+    // 步骤4: 输出检测结果
+    void printResults() {
+        int expectedCorners = patternSize.width * patternSize.height;
+
+        std::cout << "\n========== 检测结果 ==========" << std::endl;
+        std::cout << "预期内角点数量: " << expectedCorners << " ("
+                  << patternSize.width << " x " << patternSize.height << ")" << std::endl;
+        std::cout << "实际检测角点数量: " << cornerPoints.size() << std::endl;
+
+        if (cornerPoints.size() == expectedCorners) {
+            std::cout << "✓ 角点检测成功！数量匹配。" << std::endl;
+        } else {
+            std::cout << "✗ 角点数量不匹配。差异: "
+                      << (int)cornerPoints.size() - expectedCorners << std::endl;
+        }
+        std::cout << "==============================\n" << std::endl;
+    }
+
+    // 显示结果
+    void showResult() {
+        cv::namedWindow("Chessboard Detection", cv::WINDOW_NORMAL);
+        cv::resizeWindow("Chessboard Detection", 800, 600);
+        cv::imshow("Chessboard Detection", displayImage);
+        cv::waitKey(0);
+    }
+
+    // 保存结果
+    void saveResult(const std::string& outputPath) {
+        cv::imwrite(outputPath, displayImage);
+        std::cout << "结果已保存到: " << outputPath << std::endl;
+    }
+
+    // 获取角点数量
+    size_t getCornerCount() const {
+        return cornerPoints.size();
+    }
+
+    // 获取预期角点数量
+    int getExpectedCornerCount() const {
+        return patternSize.width * patternSize.height;
+    }
+};
+
+int main() {
+    // 图像路径（根据您的实际路径调整）
+    std::string imagePath = "../question9/picture9/picture9.png";
+    std::string outputPath = "../question9/picture9/result.png";
+
+    // 创建检测器对象
+    // 9x13棋盘格的内角点为8x12
+    ChessboardDetector detector(imagePath, 8, 12, 5.0f);
+
+    std::cout << "开始棋盘格角点检测..." << std::endl;
+    std::cout << "图像路径: " << imagePath << std::endl;
+
+    // 1. 过滤干扰物
+    detector.filterDistractors();
+
+    // 2. 检测角点
+    bool found = detector.detectChessboardCorners();
+
+    if (found) {
+        // 3. 计算方格尺寸
+        detector.calculateSquareSize();
+
+        // 4. 输出结果
+        detector.printResults();
+
+        // 5. 显示结果
+        detector.showResult();
+
+        // 6. 保存结果
+        detector.saveResult(outputPath);
+    } else {
+        std::cout << "\n❌ 未能检测到棋盘格角点！" << std::endl;
+        std::cout << "可能原因：" << std::endl;
+        std::cout << "1. 图像质量不佳" << std::endl;
+        std::cout << "2. 棋盘格尺寸参数不匹配" << std::endl;
+        std::cout << "3. 干扰物过滤过度" << std::endl;
+    }
+
+    return 0;
+}
+
