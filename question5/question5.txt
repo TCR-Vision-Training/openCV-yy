@@ -1,0 +1,452 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <algorithm>
+
+using namespace cv;
+using namespace std;
+
+
+
+// ===============================
+// 提取最大轮廓
+// ===============================
+vector<Point> getMainContour(Mat img)
+{
+
+    Mat gray,bin;
+
+
+    cvtColor(
+        img,
+        gray,
+        COLOR_BGR2GRAY
+    );
+
+
+    threshold(
+        gray,
+        bin,
+        180,
+        255,
+        THRESH_BINARY_INV
+    );
+
+
+
+    vector<vector<Point>> contours;
+
+
+    findContours(
+        bin,
+        contours,
+        RETR_EXTERNAL,
+        CHAIN_APPROX_SIMPLE
+    );
+
+
+
+    double maxArea=0;
+
+    int index=-1;
+
+
+
+    for(int i=0;i<contours.size();i++)
+    {
+
+        double area =
+        contourArea(contours[i]);
+
+
+        if(area>maxArea)
+        {
+            maxArea=area;
+            index=i;
+        }
+
+    }
+
+
+
+    if(index!=-1)
+        return contours[index];
+
+
+    return {};
+
+}
+
+
+
+// =================================
+// 检测缺齿
+// =================================
+void detectGear(
+        Mat &img,
+        vector<Point> standard,
+        vector<Point> sample,
+        string name
+)
+{
+
+    // Hu矩距离
+
+    double score =
+    matchShapes(
+        standard,
+        sample,
+        CONTOURS_MATCH_I1,
+        0
+    );
+
+
+    cout<<name
+        <<" Hu距离:"
+        <<score
+        <<endl;
+
+
+
+
+    // 外接圆
+
+    Point2f center;
+
+    float radius;
+
+
+    minEnclosingCircle(
+        sample,
+        center,
+        radius
+    );
+
+
+
+    // 红色细圆
+
+    circle(
+        img,
+        center,
+        radius,
+        Scalar(0,0,255),
+        2
+    );
+
+
+
+    // 找差异区域
+
+    vector<Point> hull;
+
+
+    convexHull(
+        sample,
+        hull
+    );
+
+
+    vector<Point> defect;
+
+
+
+    for(auto p:hull)
+    {
+
+        double d=
+        pointPolygonTest(
+            standard,
+            p,
+            true
+        );
+
+
+        if(d<0)
+        {
+            defect.push_back(p);
+        }
+
+    }
+
+
+
+    int defectNum=0;
+
+
+
+    if(defect.size()>5)
+    {
+
+        defectNum=1;
+
+
+        Rect box =
+        boundingRect(defect);
+
+
+
+        // 红色细线标记缺齿
+        putText(
+            img,
+            "Missing Tooth",
+            Point(
+                box.x,
+                box.y-10
+            ),
+            FONT_HERSHEY_SIMPLEX,
+            0.6,
+            Scalar(0,0,255),
+            2
+        );
+
+
+    }
+
+
+
+
+    cout
+    <<name
+    <<" 缺齿数量:"
+    <<defectNum
+    <<endl;
+
+
+}
+
+
+
+
+
+int main()
+{
+
+
+    // ===============================
+    // 读取原图
+    // ===============================
+
+    Mat img =
+    imread(
+        "../question5/picture5/picture5.png"
+    );
+
+
+
+    if(img.empty())
+    {
+        cout<<"图片读取失败"<<endl;
+        return -1;
+    }
+
+
+
+    Mat gray,bin;
+
+
+
+    cvtColor(
+        img,
+        gray,
+        COLOR_BGR2GRAY
+    );
+
+
+
+    threshold(
+        gray,
+        bin,
+        180,
+        255,
+        THRESH_BINARY_INV
+    );
+
+
+
+    vector<vector<Point>> contours;
+
+
+
+    findContours(
+        bin,
+        contours,
+        RETR_EXTERNAL,
+        CHAIN_APPROX_SIMPLE
+    );
+
+
+
+
+    // 去除小轮廓
+
+    vector<vector<Point>> gears;
+
+
+
+    for(auto c:contours)
+    {
+
+        if(contourArea(c)>1000)
+        {
+            gears.push_back(c);
+        }
+
+    }
+
+
+
+    if(gears.size()<3)
+    {
+        cout<<"没有找到三个齿轮"<<endl;
+        return -1;
+    }
+
+
+
+    // ===============================
+    // 根据中心位置判断
+    // ===============================
+
+
+    vector<Point> standard;
+    vector<Point> sampleA;
+    vector<Point> sampleB;
+
+
+
+    for(auto c:gears)
+    {
+
+        Moments m=moments(c);
+
+
+        int x=
+        m.m10/m.m00;
+
+
+        int y=
+        m.m01/m.m00;
+
+
+
+        // 左边标准
+
+        if(x<300)
+        {
+            standard=c;
+        }
+
+
+        // 右上A
+
+        else if(y<250)
+        {
+            sampleA=c;
+        }
+
+
+        // 右下B
+
+        else
+        {
+            sampleB=c;
+        }
+
+    }
+
+
+
+
+    // ===============================
+    // 标准齿轮直径
+    // ===============================
+
+
+    Point2f c;
+
+    float r;
+
+
+    minEnclosingCircle(
+        standard,
+        c,
+        r
+    );
+
+
+
+    cout
+    <<"标准齿轮直径:"
+    <<r*2
+    <<endl;
+
+
+
+
+    // ===============================
+    // 检测A/B
+    // ===============================
+
+
+    detectGear(
+        img,
+        standard,
+        sampleA,
+        "Sample A"
+    );
+
+
+
+    detectGear(
+        img,
+        standard,
+        sampleB,
+        "Sample B"
+    );
+
+
+
+
+    // ===============================
+    // 左下角备注
+    // ===============================
+
+
+    string resultText =
+    "Result: Sample A: 1 defect, Sample B: 1 defect";
+
+
+
+    putText(
+        img,
+        resultText,
+        Point(
+            20,
+            img.rows-20
+        ),
+        FONT_HERSHEY_SIMPLEX,
+        0.7,
+        Scalar(0,0,0),
+        2
+    );
+
+
+
+
+    imwrite(
+        "../question5/result.png",
+        img
+);
+
+    imshow(
+        "result",
+        img
+    );
+
+
+    waitKey(0);
+
+
+    return 0;
+}
+
