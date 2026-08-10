@@ -1,0 +1,239 @@
+#include <opencv2/opencv.hpp>
+
+#include <algorithm>
+#include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+// 饱和度 / 亮度下限：过滤掉灰白、接近黑色的像素，避免把背景误判成彩色区域
+constexpr int kSatMin = 70;
+constexpr int kValMin = 70;
+
+// 按给定路径找输入图片；找不到时依次尝试几个常见位置（当前目录、上级目录、
+// 可执行文件所在目录及其上级目录），避免因 CLion 默认工作目录而在相对路径上报错
+std::string resolve_input_path(const std::string& raw, const char* argv0) {
+    std::vector<fs::path> candidates;
+    const fs::path raw_path(raw);
+    const fs::path cwd = fs::current_path();
+    const fs::path exe_dir = fs::absolute(argv0).parent_path();
+
+    candidates.push_back(raw_path);                      // 原样（相对当前目录）
+    candidates.push_back(cwd / raw_path);                // 当前目录
+    candidates.push_back(cwd / ".." / raw_path);         // 上级目录
+    candidates.push_back(exe_dir / raw_path);            // 可执行文件所在目录
+    candidates.push_back(exe_dir / ".." / raw_path);     // 可执行文件的上级目录
+
+    for (const auto& candidate : candidates) {
+        if (fs::exists(candidate) && fs::is_regular_file(candidate)) {
+            return fs::absolute(candidate).lexically_normal().string();
+        }
+    }
+    return std::string();  // 都没找到，返回空串
+}
+
+// 单个颜色区域的配置
+struct ColorRegion {
+    std::string key;      // 英文标识
+    std::string label;    // 中文名
+    cv::Scalar low;       // HSV 下限
+    cv::Scalar high;      // HSV 上限
+    cv::Scalar color;     // 显示用颜色（BGR）
+    bool red_wrap = false;// 红色是否需要处理色相环绕（0-10 和 170-180 两段）
+
+    int area = 0;
+    double ratio = 0.0;
+};
+
+int main(int argc, char** argv) {
+    // 用法: ./hsv_segmentation <输入图片>
+    const std::string input_path =
+        argc > 1 ? argv[1] : std::string("../question8/picture8/picture8.png");
+
+    // 解析输入图片的真实路径
+    const std::string resolved_path = resolve_input_path(input_path, argv[0]);
+    if (resolved_path.empty()) {
+        std::cerr << "[错误] 找不到图片文件: " << input_path << std::endl;
+        std::cerr << "       当前工作目录: " << fs::current_path() << std::endl;
+        std::cerr << "       已尝试: 当前目录、上级目录、可执行文件所在目录"
+                  << std::endl;
+        std::cerr << "       请确认图片文件存在，或改用完整路径作为第一个参数"
+                  << std::endl;
+        return -1;
+    }
+
+    cv::Mat bgr = cv::imread(resolved_path, cv::IMREAD_COLOR);
+    if (bgr.empty()) {
+        std::cerr << "[错误] 文件存在但无法解码: " << resolved_path << std::endl;
+        return -1;
+    }
+
+    // 1. BGR -> HSV（OpenCV 中 H 范围 0-180，S/V 范围 0-255）
+    cv::Mat hsv;
+    cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+
+    // 2. 定义五种颜色的 HSV 区间
+    std::vector<ColorRegion> regions = {
+        {"red",    "红色", cv::Scalar(0, kSatMin, kValMin),
+                              cv::Scalar(10, 255, 255),
+                              cv::Scalar(0, 0, 255), true},
+        {"green",  "绿色", cv::Scalar(40, kSatMin, kValMin),
+                              cv::Scalar(80, 255, 255),
+                              cv::Scalar(0, 255, 0), false},
+        {"blue",   "蓝色", cv::Scalar(100, kSatMin, kValMin),
+                              cv::Scalar(130, 255, 255),
+                              cv::Scalar(255, 0, 0), false},
+        {"yellow", "黄色", cv::Scalar(20, kSatMin, kValMin),
+                              cv::Scalar(40, 255, 255),
+                              cv::Scalar(0, 255, 255), false},
+        {"purple", "紫色", cv::Scalar(130, kSatMin, kValMin),
+                              cv::Scalar(170, 255, 255),
+                              cv::Scalar(255, 0, 255), false},
+    };
+
+    // 3. 提取每类颜色的掩码，并统计像素面积
+    std::vector<cv::Mat> masks;
+    masks.reserve(regions.size());
+    for (auto& region : regions) {
+        cv::Mat mask;
+        if (region.red_wrap) {
+            // 红色跨越 0 度和 180 度，需要两段 inRange 再合并
+            cv::Mat mask_a, mask_b;
+            cv::inRange(hsv, cv::Scalar(0, kSatMin, kValMin),
+                        cv::Scalar(10, 255, 255), mask_a);
+            cv::inRange(hsv, cv::Scalar(170, kSatMin, kValMin),
+                        cv::Scalar(180, 255, 255), mask_b);
+            cv::bitwise_or(mask_a, mask_b, mask);
+        } else {
+            cv::inRange(hsv, region.low, region.high, mask);
+        }
+        masks.push_back(mask);
+
+        region.area = cv::countNonZero(mask);
+        region.ratio = static_cast<double>(region.area) /
+                       static_cast<double>(bgr.rows * bgr.cols);
+    }
+
+    // 4. 结果图：只在检测到的色块区域内做半透明叠加，
+    //    背景完全保持原图（白色背景不会变灰）
+    cv::Mat any_mask = cv::Mat::zeros(bgr.size(), CV_8UC1);
+    for (const auto& mask : masks) {
+        cv::bitwise_or(any_mask, mask, any_mask);
+    }
+
+    cv::Mat color_layer = cv::Mat::zeros(bgr.size(), bgr.type());
+    for (size_t i = 0; i < masks.size(); ++i) {
+        color_layer.setTo(regions[i].color, masks[i]);
+    }
+
+    cv::Mat overlay = bgr.clone();
+    cv::Mat blended;
+    cv::addWeighted(bgr, 0.55, color_layer, 0.45, 0, blended);
+    blended.copyTo(overlay, any_mask);
+
+    // 5. 按面积从大到小排序
+    std::sort(regions.begin(), regions.end(),
+              [](const ColorRegion& a, const ColorRegion& b) {
+                  return a.area > b.area;
+              });
+
+    // 6. 在图片左上角绘制图例：色块 + 颜色名 + 面积占比（按面积从大到小）
+    const double font_scale = std::clamp(overlay.cols / 1400.0, 0.5, 1.6);
+    const int font_thickness = 2;
+    const int margin = 12;
+    const int square = cvRound(22 * font_scale);        // 色块边长
+    const int line_height = cvRound(34 * font_scale);   // 行高
+
+    std::vector<std::string> legend_lines;
+    int max_text_width = 0;
+    for (const auto& region : regions) {
+        std::ostringstream oss;
+        oss << region.key << ": " << std::fixed << std::setprecision(2)
+            << (region.ratio * 100.0) << "%";
+        legend_lines.push_back(oss.str());
+
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(
+            legend_lines.back(), cv::FONT_HERSHEY_SIMPLEX, font_scale,
+            font_thickness, &baseline);
+        max_text_width = std::max(max_text_width, text_size.width);
+    }
+
+    const int legend_width = margin * 2 + square + 10 + max_text_width;
+    const int legend_height =
+        margin * 2 + line_height * static_cast<int>(legend_lines.size());
+    const cv::Rect legend_rect(margin, margin, legend_width, legend_height);
+
+    // 图例背景：半透明黑色，保证文字清晰
+    cv::Mat legend_roi = overlay(legend_rect);
+    cv::addWeighted(legend_roi, 0.45,
+                    cv::Mat::zeros(legend_roi.size(), legend_roi.type()),
+                    0.55, 0, legend_roi);
+
+    for (size_t i = 0; i < legend_lines.size(); ++i) {
+        const int y_center = margin + cvRound(line_height * (i + 0.5));
+        const int square_y = y_center - square / 2;
+
+        // 色块 + 白色描边
+        cv::rectangle(overlay,
+                      cv::Rect(margin, square_y, square, square),
+                      regions[i].color, cv::FILLED);
+        cv::rectangle(overlay,
+                      cv::Rect(margin, square_y, square, square),
+                      cv::Scalar(255, 255, 255), 1);
+
+        // 文字垂直居中对齐色块
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(
+            legend_lines[i], cv::FONT_HERSHEY_SIMPLEX, font_scale,
+            font_thickness, &baseline);
+        cv::putText(overlay, legend_lines[i],
+                    cv::Point(margin + square + 10,
+                              y_center + text_size.height / 2),
+                    cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                    cv::Scalar(255, 255, 255), font_thickness, cv::LINE_AA);
+    }
+
+    // 7. 输出统计结果
+    std::cout << "输入图片 : " << resolved_path << std::endl;
+    std::cout << "图片尺寸 : " << bgr.cols << " x " << bgr.rows
+              << "（总像素 " << bgr.rows * bgr.cols << "）" << std::endl;
+    std::cout << "--------------------------------------------------" << std::endl;
+    std::cout << std::left << std::setw(4) << "序号"
+              << std::setw(10) << "颜色"
+              << std::setw(14) << "像素面积"
+              << std::setw(10) << "占比" << std::endl;
+    std::cout << "--------------------------------------------------" << std::endl;
+
+    int rank = 1;
+    for (const auto& region : regions) {
+        std::cout << std::left << std::setw(4) << rank++
+                  << std::setw(10) << (region.key + " " + region.label)
+                  << std::setw(14) << region.area
+                  << std::setw(9) << std::fixed << std::setprecision(2)
+                  << (region.ratio * 100.0) << "%" << std::endl;
+    }
+    std::cout << "--------------------------------------------------" << std::endl;
+
+    // 8. 缩小显示图片（宽度超过 900 时等比缩小），弹出窗口查看
+    cv::Mat display;
+    const double display_scale = std::min(1.0, 900.0 / overlay.cols);
+    if (display_scale < 1.0) {
+        cv::resize(overlay, display, cv::Size(), display_scale,
+                   display_scale, cv::INTER_AREA);
+    } else {
+        display = overlay;
+    }
+
+    cv::imshow("分割结果", display);
+    std::cout << "已弹出分割结果窗口，按任意键关闭" << std::endl;
+    cv::waitKey(0);
+    cv::destroyAllWindows();
+
+    return 0;
+}
+
