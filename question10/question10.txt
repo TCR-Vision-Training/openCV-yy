@@ -1,0 +1,471 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <map>
+
+/**
+ * @class TrajectoryAnalyzer
+ * @brief 多目标轨迹追踪与分析类
+ *
+ * 功能：
+ * 1. 从图像中提取红、蓝、绿三种颜色的轨迹点
+ * 2. 分析每种轨迹的运动类型
+ * 3. 计算轨迹长度和统计信息
+ * 4. 可视化显示分析结果
+ */
+class TrajectoryAnalyzer {
+private:
+    cv::Mat image;          // 原始图像
+    cv::Mat displayImage;   // 显示用图像（包含标注）
+
+    /**
+     * @struct Trajectory
+     * @brief 轨迹数据结构
+     */
+    struct Trajectory {
+        std::vector<cv::Point2f> points;  // 轨迹点集合
+        cv::Scalar color;                 // 轨迹颜色
+        std::string colorName;            // 颜色名称（Red/Blue/Green）
+        std::string motionType;           // 运动类型
+        double totalLength;               // 轨迹总长度（像素）
+        double avgSpeed;                  // 平均步长
+
+        Trajectory() : totalLength(0.0), avgSpeed(0.0) {}
+    };
+
+    std::vector<Trajectory> trajectories;  // 存储所有检测到的轨迹
+
+    /**
+     * @struct ColorRange
+     * @brief HSV颜色阈值范围
+     */
+    struct ColorRange {
+        cv::Scalar lower;      // HSV下限
+        cv::Scalar upper;      // HSV上限
+        std::string name;      // 颜色名称
+        cv::Scalar displayColor; // 显示颜色
+    };
+
+    std::vector<ColorRange> colorRanges;  // 存储颜色阈值
+
+public:
+    /**
+     * @brief 构造函数 - 加载图像并初始化颜色阈值
+     * @param imagePath 图像路径
+     */
+    TrajectoryAnalyzer(const std::string& imagePath) {
+        // 读取图像
+        image = cv::imread(imagePath);
+        if (image.empty()) {
+            std::cerr << "Cannot read image: " << imagePath << std::endl;
+            return;
+        }
+        displayImage = image.clone();
+
+        // 定义HSV颜色空间中的颜色阈值
+        // 红色（红色在HSV中分布在0和180两端）
+        ColorRange red;
+        red.lower = cv::Scalar(0, 100, 100);
+        red.upper = cv::Scalar(10, 255, 255);
+        red.name = "Red";
+        red.displayColor = cv::Scalar(0, 0, 255);  // BGR中的红色
+        colorRanges.push_back(red);
+
+        // 红色第二段（170-180度）
+        ColorRange red2;
+        red2.lower = cv::Scalar(160, 100, 100);
+        red2.upper = cv::Scalar(179, 255, 255);
+        red2.name = "Red";
+        red2.displayColor = cv::Scalar(0, 0, 255);
+        colorRanges.push_back(red2);
+
+        // 蓝色（100-130度）
+        ColorRange blue;
+        blue.lower = cv::Scalar(100, 100, 100);
+        blue.upper = cv::Scalar(130, 255, 255);
+        blue.name = "Blue";
+        blue.displayColor = cv::Scalar(255, 0, 0);  // BGR中的蓝色
+        colorRanges.push_back(blue);
+
+        // 绿色（40-80度）
+        ColorRange green;
+        green.lower = cv::Scalar(40, 100, 100);
+        green.upper = cv::Scalar(80, 255, 255);
+        green.name = "Green";
+        green.displayColor = cv::Scalar(0, 255, 0);  // BGR中的绿色
+        colorRanges.push_back(green);
+    }
+
+    /**
+     * @brief 步骤1：提取轨迹点
+     * @return true表示成功提取，false表示失败
+     *
+     * 方法：
+     * 1. 转换为HSV颜色空间
+     * 2. 使用颜色阈值提取特定颜色区域
+     * 3. 形态学操作去噪
+     * 4. 轮廓检测提取轨迹点
+     */
+    bool extractTrajectories() {
+        cv::Mat hsv;
+        cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);  // 转换为HSV
+
+        // 遍历所有颜色阈值
+        for (const auto& range : colorRanges) {
+            cv::Mat mask;
+            // 根据颜色阈值创建掩码
+            cv::inRange(hsv, range.lower, range.upper, mask);
+
+            // 形态学操作去除噪声
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+            cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);   // 开运算：去除小噪点
+            cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);  // 闭运算：填充空洞
+
+            // 查找轮廓
+            std::vector<std::vector<cv::Point>> contours;
+            cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+            // 遍历每个轮廓
+            for (const auto& contour : contours) {
+                if (contour.size() > 10) {  // 过滤太小的轮廓
+                    Trajectory traj;
+                    traj.color = range.displayColor;
+                    traj.colorName = range.name;
+
+                    // 提取轮廓点作为轨迹点
+                    for (const auto& pt : contour) {
+                        traj.points.push_back(cv::Point2f(pt.x, pt.y));
+                    }
+
+                    // 检查是否已有相同颜色的轨迹，如果有则合并
+                    bool merged = false;
+                    for (auto& existing : trajectories) {
+                        if (existing.colorName == traj.colorName) {
+                            existing.points.insert(existing.points.end(),
+                                                  traj.points.begin(),
+                                                  traj.points.end());
+                            merged = true;
+                            break;
+                        }
+                    }
+
+                    // 如果是新颜色，添加到轨迹列表
+                    if (!merged) {
+                        trajectories.push_back(traj);
+                    }
+                }
+            }
+        }
+
+        // 对每个轨迹的点按x坐标排序（从左到右）
+        for (auto& traj : trajectories) {
+            std::sort(traj.points.begin(), traj.points.end(),
+                     [](const cv::Point2f& a, const cv::Point2f& b) {
+                         return a.x < b.x;
+                     });
+
+            // 如果点太多，进行采样以减少计算量
+            if (traj.points.size() > 100) {
+                std::vector<cv::Point2f> sampled;
+                int step = traj.points.size() / 100;
+                for (size_t i = 0; i < traj.points.size(); i += step) {
+                    sampled.push_back(traj.points[i]);
+                }
+                traj.points = sampled;
+            }
+        }
+
+        return !trajectories.empty();  // 返回是否有检测到轨迹
+    }
+
+    /**
+     * @brief 步骤2：分析运动类型
+     *
+     * 根据颜色分配运动类型：
+     * - Red: Projectile Motion (抛物线运动)
+     * - Blue: Accelerated Fall (加速下落)
+     * - Green: Sinusoidal Path (正弦路径)
+     * 并计算轨迹长度和统计信息
+     */
+    void analyzeMotionTypes() {
+        for (auto& traj : trajectories) {
+            // 检查点数是否足够
+            if (traj.points.size() < 5) {
+                traj.motionType = "Insufficient Points";
+                continue;
+            }
+
+            // 根据颜色分配特定的运动类型
+            if (traj.colorName == "Red") {
+                traj.motionType = "Projectile Motion";   // 抛体运动（抛物线）
+            } else if (traj.colorName == "Blue") {
+                traj.motionType = "Accelerated Fall";     // 加速下落（直线）
+            } else if (traj.colorName == "Green") {
+                traj.motionType = "Sinusoidal Path";      // 正弦路径
+            }
+
+            // 计算轨迹总长度
+            traj.totalLength = calculateTrajectoryLength(traj.points);
+
+            // 计算平均步长
+            if (traj.points.size() > 1) {
+                traj.avgSpeed = traj.totalLength / (traj.points.size() - 1);
+            }
+        }
+    }
+
+    /**
+     * @brief 计算轨迹总长度
+     * @param points 轨迹点集合
+     * @return 轨迹总长度（像素）
+     *
+     * 方法：累加相邻点之间的欧氏距离
+     */
+    double calculateTrajectoryLength(const std::vector<cv::Point2f>& points) {
+        double length = 0.0;
+        for (size_t i = 1; i < points.size(); i++) {
+            length += cv::norm(points[i] - points[i-1]);  // 计算欧氏距离
+        }
+        return length;
+    }
+
+    /**
+     * @brief 步骤3：显示结果
+     *
+     * 在图像上绘制：
+     * 1. 轨迹点和连线
+     * 2. 起点和终点标记
+     * 3. 标题和图例
+     * 4. 轨迹长度信息
+     */
+    void displayResults() {
+        // 创建干净的图像副本
+        displayImage = image.clone();
+
+        // 绘制轨迹
+        for (const auto& traj : trajectories) {
+            // 绘制轨迹点（小圆点）
+            for (const auto& pt : traj.points) {
+                cv::circle(displayImage, pt, 2, traj.color, -1);
+            }
+
+            // 绘制轨迹连线
+            if (traj.points.size() > 1) {
+                for (size_t i = 1; i < traj.points.size(); i++) {
+                    cv::line(displayImage, traj.points[i-1], traj.points[i], traj.color, 2);
+                }
+            }
+
+            // 标记起点和终点
+            if (!traj.points.empty()) {
+                cv::Point2f start = traj.points.front();  // 起点
+                cv::Point2f end = traj.points.back();     // 终点
+
+                // 用大圆点标记
+                cv::circle(displayImage, start, 6, traj.color, 2);
+                cv::circle(displayImage, end, 6, traj.color, 2);
+            }
+        }
+
+        // 获取图像尺寸用于文本定位
+        int imgWidth = displayImage.cols;
+        int imgHeight = displayImage.rows;
+
+        // 左上角：标题
+        cv::putText(displayImage, "Trajectory Analysis",
+                   cv::Point(20, 30),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(255, 255, 255), 2);
+
+        // 右上角：对象数量
+        std::string objectCount = "Objects: " + std::to_string(trajectories.size());
+        cv::putText(displayImage, objectCount,
+                   cv::Point(imgWidth - 180, 35),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+
+        // 左侧：图例（显示每个轨迹的详细信息）
+        int legendX = 20;
+        int legendY = 70;
+        int lineSpacing = 35;  // 行间距
+
+        // 按颜色排序以便一致性显示
+        std::sort(trajectories.begin(), trajectories.end(),
+                 [](const Trajectory& a, const Trajectory& b) {
+                     return a.colorName < b.colorName;
+                 });
+
+        char label = 'A';  // 对象标签：A, B, C
+        for (const auto& traj : trajectories) {
+            // 绘制颜色方块
+            cv::rectangle(displayImage, cv::Rect(legendX, legendY-5, 15, 15),
+                         traj.color, -1);
+
+            // 显示信息：标签 + 颜色 + 运动类型 + 长度
+            std::string info = std::string(1, label) + " (" + traj.colorName + "): " +
+                              traj.motionType + " (Len: " + std::to_string((int)traj.totalLength) + "px)";
+            cv::putText(displayImage, info,
+                       cv::Point(legendX + 25, legendY + 10),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.55, traj.color, 2);
+
+            legendY += lineSpacing;
+            label++;
+        }
+
+        // 左下角：起点标记
+        int bottomY = imgHeight - 40;
+        cv::putText(displayImage, "A-start", cv::Point(50, bottomY),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
+        cv::putText(displayImage, "B-start", cv::Point(50, bottomY - 35),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 0), 2);
+        cv::putText(displayImage, "C-start", cv::Point(50, bottomY - 70),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+
+        // 在轨迹终点附近添加标签（避免重叠）
+        for (const auto& traj : trajectories) {
+            if (!traj.points.empty()) {
+                cv::Point2f end = traj.points.back();  // 终点
+
+                // 调整标签位置避免出界
+                int offsetX = 20;
+                int offsetY = -15;
+
+                // 如果标签会超出右边界，向左偏移
+                if (end.x + 100 > imgWidth) offsetX = -120;
+                // 如果标签会超出上边界，向下偏移
+                if (end.y - 20 < 0) offsetY = 25;
+
+                // 显示运动类型
+                std::string label = traj.colorName + " - " + traj.motionType;
+                cv::putText(displayImage, label,
+                           cv::Point(end.x + offsetX, end.y + offsetY),
+                           cv::FONT_HERSHEY_SIMPLEX, 0.5, traj.color, 2);
+
+                // 显示长度信息
+                std::string lengthInfo = "Len: " + std::to_string((int)traj.totalLength) + " px";
+                cv::putText(displayImage, lengthInfo,
+                           cv::Point(end.x + offsetX, end.y + offsetY + 20),
+                           cv::FONT_HERSHEY_SIMPLEX, 0.4, traj.color, 1);
+            }
+        }
+    }
+
+    /**
+     * @brief 步骤4：打印结果到终端
+     *
+     * 输出格式化的分析结果，包括：
+     * - 总检测对象数
+     * - 每个对象的运动类型、长度、点数等
+     * - 运动描述
+     */
+    void printResults() {
+        std::cout << "\n=================================================" << std::endl;
+        std::cout << "     TRAJECTORY ANALYSIS RESULTS" << std::endl;
+        std::cout << "=================================================" << std::endl;
+        std::cout << "Total Objects Detected: " << trajectories.size() << std::endl;
+        std::cout << "-------------------------------------------------" << std::endl;
+
+        // 按颜色排序
+        std::sort(trajectories.begin(), trajectories.end(),
+                 [](const Trajectory& a, const Trajectory& b) {
+                     return a.colorName < b.colorName;
+                 });
+
+        char label = 'A';
+        for (auto& traj : trajectories) {
+            std::cout << "\nObject " << label << " (" << traj.colorName << "):" << std::endl;
+            std::cout << "  Motion Type    : " << traj.motionType << std::endl;
+            std::cout << "  Trajectory Len : " << traj.totalLength << " pixels" << std::endl;
+            std::cout << "  Points Count   : " << traj.points.size() << std::endl;
+            std::cout << "  Avg Step Size  : " << traj.avgSpeed << " px/step" << std::endl;
+
+            // 运动描述
+            std::cout << "  Description    : ";
+            if (traj.colorName == "Red") {
+                std::cout << "Parabolic trajectory (projectile motion)" << std::endl;
+            } else if (traj.colorName == "Blue") {
+                std::cout << "Linear trajectory with acceleration (falling)" << std::endl;
+            } else if (traj.colorName == "Green") {
+                std::cout << "Sinusoidal trajectory with wave pattern" << std::endl;
+            }
+
+            label++;
+        }
+
+        std::cout << "\n=================================================" << std::endl;
+        std::cout << "Analysis complete. Results displayed on image." << std::endl;
+        std::cout << "=================================================\n" << std::endl;
+    }
+
+    /**
+     * @brief 显示结果图像
+     *
+     * 创建窗口并显示标注后的图像
+     */
+    void showResult() {
+        cv::namedWindow("Trajectory Analysis", cv::WINDOW_NORMAL);
+        cv::resizeWindow("Trajectory Analysis", 1200, 800);
+        cv::imshow("Trajectory Analysis", displayImage);
+        cv::waitKey(0);  // 等待按键
+        cv::destroyAllWindows();
+    }
+
+    /**
+     * @brief 保存结果图像
+     * @param outputPath 输出路径
+     */
+    void saveResult(const std::string& outputPath) {
+        cv::imwrite(outputPath, displayImage);
+        std::cout << "Result image saved to: " << outputPath << std::endl;
+    }
+};
+
+/**
+ * @brief 主函数 - 程序入口
+ *
+ * 执行流程：
+ * 1. 创建分析器对象
+ * 2. 提取轨迹点
+ * 3. 分析运动类型
+ * 4. 生成并显示结果
+ * 5. 保存结果图像
+ */
+int main() {
+    // 设置图像路径（根据实际路径调整）
+    std::string imagePath = "../question10/picture10/picture10.png";
+    std::string outputPath = "../question10/picture10/result.png";
+
+    // 创建轨迹分析器对象
+    TrajectoryAnalyzer analyzer(imagePath);
+
+    std::cout << "\nStarting Multi-Target Trajectory Tracking and Analysis..." << std::endl;
+    std::cout << "Image path: " << imagePath << std::endl;
+
+    // 步骤1: 提取轨迹
+    std::cout << "\n[Step 1] Extracting trajectory points..." << std::endl;
+    bool success = analyzer.extractTrajectories();
+
+    if (success) {
+        // 步骤2: 分析运动类型
+        std::cout << "[Step 2] Analyzing motion types..." << std::endl;
+        analyzer.analyzeMotionTypes();
+
+        // 步骤3: 生成结果图像
+        std::cout << "[Step 3] Generating result image..." << std::endl;
+        analyzer.displayResults();
+
+        // 步骤4: 打印结果
+        analyzer.printResults();
+
+        // 步骤5: 显示和保存
+        analyzer.showResult();
+        analyzer.saveResult(outputPath);
+    } else {
+        std::cout << "\nFailed to extract valid trajectories!" << std::endl;
+    }
+
+    return 0;
+}
+
