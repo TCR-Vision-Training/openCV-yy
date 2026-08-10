@@ -1,0 +1,517 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/ximgproc.hpp>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+using namespace cv;
+using namespace std;
+
+
+//================================
+// 计算骨架长度
+//================================
+
+double calcLength(Mat skel)
+{
+    double len=0;
+
+
+    for(int y=1;y<skel.rows-1;y++)
+    {
+        for(int x=1;x<skel.cols-1;x++)
+        {
+
+            if(skel.at<uchar>(y,x)>0)
+            {
+
+                len+=1;
+
+
+                if(
+                skel.at<uchar>(y+1,x+1)>0 ||
+                skel.at<uchar>(y-1,x+1)>0)
+                {
+                    len+=0.414;
+                }
+
+            }
+
+        }
+    }
+
+
+    return len;
+}
+
+
+
+
+
+struct Crack
+{
+    double length;
+    Mat mask;
+    Point center;
+};
+
+
+
+
+
+
+int main()
+{
+
+
+    //-----------------------------
+    //读取图片
+    //-----------------------------
+
+    Mat src =
+    imread("../question7/picture7/picture7.png");
+
+
+    if(src.empty())
+    {
+        cout<<"图片读取失败"<<endl;
+        return -1;
+    }
+
+
+
+    Mat gray;
+
+
+    cvtColor(
+        src,
+        gray,
+        COLOR_BGR2GRAY
+    );
+
+
+
+
+    //-----------------------------
+    //增强暗裂纹
+    //-----------------------------
+
+
+    Mat enhance;
+
+
+    Ptr<CLAHE> clahe =
+    createCLAHE(
+        3.0,
+        Size(8,8)
+    );
+
+
+    clahe->apply(
+        gray,
+        enhance
+    );
+
+
+
+
+
+    //-----------------------------
+    //低阈值提取黑色裂纹
+    //-----------------------------
+
+
+    Mat binary;
+
+
+    adaptiveThreshold(
+        enhance,
+        binary,
+        255,
+        ADAPTIVE_THRESH_GAUSSIAN_C,
+        THRESH_BINARY_INV,
+        51,
+        8
+    );
+
+
+
+
+
+
+    //-----------------------------
+    //删除中间焊缝
+    //-----------------------------
+
+
+    Mat weldMask =
+    Mat::ones(
+        binary.size(),
+        CV_8UC1
+    )*255;
+
+
+
+    rectangle(
+        weldMask,
+        Rect(
+            binary.cols/2-70,
+            0,
+            140,
+            binary.rows
+        ),
+        Scalar(0),
+        -1
+    );
+
+
+
+    bitwise_and(
+        binary,
+        weldMask,
+        binary
+    );
+
+
+
+
+
+
+    //-----------------------------
+    //形态学连接裂纹
+    //-----------------------------
+
+
+    Mat kernel =
+    getStructuringElement(
+        MORPH_ELLIPSE,
+        Size(3,3)
+    );
+
+
+
+    morphologyEx(
+        binary,
+        binary,
+        MORPH_CLOSE,
+        kernel
+    );
+
+
+
+
+
+    //-----------------------------
+    //骨架细化
+    //-----------------------------
+
+
+    Mat skeleton;
+
+
+    cv::ximgproc::thinning(
+        binary,
+        skeleton,
+        cv::ximgproc::THINNING_ZHANGSUEN
+    );
+
+
+
+
+
+
+    //-----------------------------
+    //连通域
+    //-----------------------------
+
+
+    Mat labels,stats,centers;
+
+
+    int num =
+    connectedComponentsWithStats(
+        skeleton,
+        labels,
+        stats,
+        centers,
+        8
+    );
+
+
+
+    vector<Crack> cracks;
+
+
+
+
+
+    //-----------------------------
+    //过滤
+    //-----------------------------
+
+
+    for(int i=1;i<num;i++)
+    {
+
+
+        int area =
+        stats.at<int>(
+            i,
+            CC_STAT_AREA
+        );
+
+
+        if(area<15)
+            continue;
+
+
+
+        Mat mask =
+        labels==i;
+
+
+
+        double len =
+        calcLength(mask);
+
+
+
+        //骨架长度补偿
+        len*=1.15;
+
+
+
+        //去除噪声和焊缝
+        if(len<50 || len>350)
+            continue;
+
+
+
+        Point c(
+            centers.at<double>(i,0),
+            centers.at<double>(i,1)
+        );
+
+
+
+        cracks.push_back(
+        {
+            len,
+            mask,
+            c
+        });
+
+
+    }
+
+
+
+
+
+    //-----------------------------
+    //按照长度排序
+    //-----------------------------
+
+
+    sort(
+        cracks.begin(),
+        cracks.end(),
+        [](Crack&a,Crack&b)
+        {
+            return a.length>b.length;
+        }
+    );
+
+
+
+    //只保留三条
+
+    if(cracks.size()>3)
+        cracks.resize(3);
+
+
+
+
+
+
+    //-----------------------------
+    //绘制
+    //-----------------------------
+
+
+    Mat result =
+    src.clone();
+
+
+
+    double maxLen=0;
+
+
+
+    Scalar red(
+        0,
+        0,
+        255
+    );
+
+
+
+
+    for(int i=0;i<cracks.size();i++)
+    {
+
+
+        maxLen =
+        max(
+            maxLen,
+            cracks[i].length
+        );
+
+
+
+        //画裂纹红色
+
+        for(int y=0;y<src.rows;y++)
+        {
+            for(int x=0;x<src.cols;x++)
+            {
+
+                if(
+                cracks[i].mask.at<uchar>(y,x)
+                )
+                {
+
+                    result.at<Vec3b>(y,x)
+                    =
+                    Vec3b(
+                        0,
+                        0,
+                        255
+                    );
+
+                }
+
+            }
+        }
+
+
+
+
+
+        //----------------------
+        //编号位置调整
+        //----------------------
+
+        Point pos =
+        cracks[i].center;
+
+
+        if(i==0)
+        {
+            pos.x+=80;
+            pos.y-=60;
+        }
+
+        else if(i==1)
+        {
+            pos.x+=100;
+            pos.y+=80;
+        }
+
+        else
+        {
+            pos.x-=120;
+            pos.y-=80;
+        }
+
+
+
+
+
+        putText(
+            result,
+            "Crack-"+to_string(i+1),
+            pos,
+            FONT_HERSHEY_SIMPLEX,
+            1,
+            red,
+            3
+        );
+
+
+    }
+
+
+
+
+
+    //-----------------------------
+    //左上角信息
+    //-----------------------------
+
+
+    putText(
+        result,
+        "Cracks: "+
+        to_string(cracks.size()),
+        Point(40,60),
+        FONT_HERSHEY_SIMPLEX,
+        1.5,
+        red,
+        3
+    );
+
+
+
+    putText(
+        result,
+        "Max Length: "+
+        to_string((int)maxLen)+" px",
+        Point(40,120),
+        FONT_HERSHEY_SIMPLEX,
+        1.5,
+        red,
+        3
+    );
+
+
+
+
+
+
+
+    cout<<"===================="<<endl;
+
+    cout<<"裂纹数量:"
+        <<cracks.size()
+        <<endl;
+
+
+    cout<<"最长长度:"
+        <<maxLen
+        <<" px"
+        <<endl;
+
+
+
+
+
+    imwrite(
+        "../question7/result7.png",
+        result
+    );
+
+
+
+    imshow(
+        "Crack Detection",
+        result
+    );
+
+    waitKey(0);
+
+
+
+    return 0;
+
+}
