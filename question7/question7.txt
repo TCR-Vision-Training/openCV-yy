@@ -1,38 +1,51 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/ximgproc.hpp>
+
 #include <iostream>
 #include <vector>
-#include <algorithm>
 
 using namespace cv;
 using namespace std;
 
 
 //================================
-// 计算骨架长度
+//计算骨架长度
 //================================
 
-double calcLength(Mat skel)
+double calcLength(Mat skeleton)
 {
-    double len=0;
+    double length=0;
 
 
-    for(int y=1;y<skel.rows-1;y++)
+    int dx[8]={1,1,0,-1,-1,-1,0,1};
+    int dy[8]={0,1,1,1,0,-1,-1,-1};
+
+
+    for(int y=1;y<skeleton.rows-1;y++)
     {
-        for(int x=1;x<skel.cols-1;x++)
+        for(int x=1;x<skeleton.cols-1;x++)
         {
 
-            if(skel.at<uchar>(y,x)>0)
+            if(skeleton.at<uchar>(y,x)>0)
             {
 
-                len+=1;
-
-
-                if(
-                skel.at<uchar>(y+1,x+1)>0 ||
-                skel.at<uchar>(y-1,x+1)>0)
+                for(int k=0;k<8;k++)
                 {
-                    len+=0.414;
+
+                    int nx=x+dx[k];
+                    int ny=y+dy[k];
+
+
+                    if(skeleton.at<uchar>(ny,nx)>0)
+                    {
+
+                        if(k%2==0)
+                            length+=1.0;
+                        else
+                            length+=1.414;
+
+                    }
+
                 }
 
             }
@@ -41,19 +54,8 @@ double calcLength(Mat skel)
     }
 
 
-    return len;
+    return length/2.0;
 }
-
-
-
-
-
-struct Crack
-{
-    double length;
-    Mat mask;
-    Point center;
-};
 
 
 
@@ -64,15 +66,15 @@ int main()
 {
 
 
-    //-----------------------------
+    //==========================
     //读取图片
-    //-----------------------------
+    //==========================
 
-    Mat src =
+    Mat img =
     imread("../question7/picture7/picture7.png");
 
 
-    if(src.empty())
+    if(img.empty())
     {
         cout<<"图片读取失败"<<endl;
         return -1;
@@ -84,310 +86,275 @@ int main()
 
 
     cvtColor(
-        src,
-        gray,
-        COLOR_BGR2GRAY
-    );
-
-
-
-
-    //-----------------------------
-    //增强暗裂纹
-    //-----------------------------
-
-
-    Mat enhance;
-
-
-    Ptr<CLAHE> clahe =
-    createCLAHE(
-        3.0,
-        Size(8,8)
-    );
-
-
-    clahe->apply(
-        gray,
-        enhance
+            img,
+            gray,
+            COLOR_BGR2GRAY
     );
 
 
 
 
 
-    //-----------------------------
-    //低阈值提取黑色裂纹
-    //-----------------------------
+    //==========================
+    //1 黑帽增强暗裂纹
+    //==========================
+
+    Mat blackhat;
 
 
-    Mat binary;
-
-
-    adaptiveThreshold(
-        enhance,
-        binary,
-        255,
-        ADAPTIVE_THRESH_GAUSSIAN_C,
-        THRESH_BINARY_INV,
-        51,
-        8
-    );
-
-
-
-
-
-
-    //-----------------------------
-    //删除中间焊缝
-    //-----------------------------
-
-
-    Mat weldMask =
-    Mat::ones(
-        binary.size(),
-        CV_8UC1
-    )*255;
-
-
-
-    rectangle(
-        weldMask,
-        Rect(
-            binary.cols/2-70,
-            0,
-            140,
-            binary.rows
-        ),
-        Scalar(0),
-        -1
-    );
-
-
-
-    bitwise_and(
-        binary,
-        weldMask,
-        binary
-    );
-
-
-
-
-
-
-    //-----------------------------
-    //形态学连接裂纹
-    //-----------------------------
-
-
-    Mat kernel =
+    Mat bhKernel =
     getStructuringElement(
-        MORPH_ELLIPSE,
-        Size(3,3)
+            MORPH_RECT,
+            Size(25,25)
     );
 
 
 
     morphologyEx(
-        binary,
-        binary,
-        MORPH_CLOSE,
-        kernel
+            gray,
+            blackhat,
+            MORPH_BLACKHAT,
+            bhKernel
     );
 
 
 
 
 
-    //-----------------------------
-    //骨架细化
-    //-----------------------------
+    //==========================
+    //2 二值化
+    //==========================
+
+    Mat binary;
 
 
-    Mat skeleton;
-
-
-    cv::ximgproc::thinning(
-        binary,
-        skeleton,
-        cv::ximgproc::THINNING_ZHANGSUEN
+    threshold(
+            blackhat,
+            binary,
+            10,
+            255,
+            THRESH_BINARY
     );
 
 
 
 
 
-
-    //-----------------------------
-    //连通域
-    //-----------------------------
-
-
-    Mat labels,stats,centers;
+    //==========================
+    //3 小范围连接裂纹
+    //==========================
 
 
-    int num =
-    connectedComponentsWithStats(
-        skeleton,
-        labels,
-        stats,
-        centers,
-        8
+    Mat kernel =
+    getStructuringElement(
+            MORPH_ELLIPSE,
+            Size(5,5)
     );
 
 
 
-    vector<Crack> cracks;
+    morphologyEx(
+            binary,
+            binary,
+            MORPH_CLOSE,
+            kernel
+    );
 
 
 
 
 
-    //-----------------------------
-    //过滤
-    //-----------------------------
+    //==========================
+    //4 轻微连接断点
+    //==========================
 
 
-    for(int i=1;i<num;i++)
+    Mat connect;
+
+
+    Mat connectKernel =
+    getStructuringElement(
+            MORPH_ELLIPSE,
+            Size(9,9)
+    );
+
+
+
+    morphologyEx(
+            binary,
+            connect,
+            MORPH_CLOSE,
+            connectKernel
+    );
+
+
+
+    dilate(
+            connect,
+            connect,
+            getStructuringElement(
+                    MORPH_RECT,
+                    Size(3,3)
+            )
+    );
+
+
+
+
+
+    imshow(
+            "connect",
+            connect
+    );
+
+
+
+
+
+    //==========================
+    //5 找裂纹区域
+    //==========================
+
+
+    vector<vector<Point>> contours;
+
+
+
+    findContours(
+            connect,
+            contours,
+            RETR_EXTERNAL,
+            CHAIN_APPROX_NONE
+    );
+
+
+
+
+    Mat result =
+    img.clone();
+
+
+
+    int crackCount=0;
+
+
+    double maxLength=0;
+
+
+
+
+    cout<<"===================="<<endl;
+
+
+
+
+
+    for(int i=0;i<contours.size();i++)
     {
 
 
-        int area =
-        stats.at<int>(
-            i,
-            CC_STAT_AREA
-        );
+        double area =
+        contourArea(contours[i]);
 
 
-        if(area<15)
+
+        //过滤噪声和焊缝
+
+        if(area<30 || area>3000)
             continue;
 
 
 
+        crackCount++;
+
+
+
+
+
+        //=====================
+        //生成单条mask
+        //=====================
+
+
         Mat mask =
-        labels==i;
+        Mat::zeros(
+                gray.size(),
+                CV_8UC1
+        );
+
+
+
+        drawContours(
+                mask,
+                contours,
+                i,
+                Scalar(255),
+                FILLED
+        );
+
+
+
+
+
+
+        //=====================
+        //骨架提取
+        //=====================
+
+
+        Mat skeleton;
+
+
+
+        ximgproc::thinning(
+                mask,
+                skeleton,
+                ximgproc::THINNING_ZHANGSUEN
+        );
+
 
 
 
         double len =
-        calcLength(mask);
+        calcLength(skeleton);
 
 
 
-        //骨架长度补偿
-        len*=1.15;
+        cout
+        <<"Crack "
+        <<crackCount
+        <<" length="
+        <<len
+        <<" pixels"
+        <<endl;
 
 
 
-        //去除噪声和焊缝
-        if(len<50 || len>350)
-            continue;
+
+        if(len>maxLength)
+            maxLength=len;
 
 
 
-        Point c(
-            centers.at<double>(i,0),
-            centers.at<double>(i,1)
-        );
 
 
 
-        cracks.push_back(
+        //=====================
+        //红色绘制骨架
+        //=====================
+
+
+        for(int y=0;y<skeleton.rows;y++)
         {
-            len,
-            mask,
-            c
-        });
-
-
-    }
-
-
-
-
-
-    //-----------------------------
-    //按照长度排序
-    //-----------------------------
-
-
-    sort(
-        cracks.begin(),
-        cracks.end(),
-        [](Crack&a,Crack&b)
-        {
-            return a.length>b.length;
-        }
-    );
-
-
-
-    //只保留三条
-
-    if(cracks.size()>3)
-        cracks.resize(3);
-
-
-
-
-
-
-    //-----------------------------
-    //绘制
-    //-----------------------------
-
-
-    Mat result =
-    src.clone();
-
-
-
-    double maxLen=0;
-
-
-
-    Scalar red(
-        0,
-        0,
-        255
-    );
-
-
-
-
-    for(int i=0;i<cracks.size();i++)
-    {
-
-
-        maxLen =
-        max(
-            maxLen,
-            cracks[i].length
-        );
-
-
-
-        //画裂纹红色
-
-        for(int y=0;y<src.rows;y++)
-        {
-            for(int x=0;x<src.cols;x++)
+            for(int x=0;x<skeleton.cols;x++)
             {
 
-                if(
-                cracks[i].mask.at<uchar>(y,x)
-                )
+                if(skeleton.at<uchar>(y,x)>0)
                 {
 
                     result.at<Vec3b>(y,x)
                     =
-                    Vec3b(
-                        0,
-                        0,
-                        255
-                    );
+                    Vec3b(0,0,255);
 
                 }
 
@@ -398,82 +365,27 @@ int main()
 
 
 
-        //----------------------
-        //编号位置调整
-        //----------------------
+        //编号
 
-        Point pos =
-        cracks[i].center;
-
-
-        if(i==0)
-        {
-            pos.x+=80;
-            pos.y-=60;
-        }
-
-        else if(i==1)
-        {
-            pos.x+=100;
-            pos.y+=80;
-        }
-
-        else
-        {
-            pos.x-=120;
-            pos.y-=80;
-        }
-
-
+        Rect box =
+        boundingRect(contours[i]);
 
 
 
         putText(
-            result,
-            "Crack-"+to_string(i+1),
-            pos,
-            FONT_HERSHEY_SIMPLEX,
-            1,
-            red,
-            3
+                result,
+                "Crack-"+to_string(crackCount),
+                Point(
+                        box.x,
+                        box.y-10
+                ),
+                FONT_HERSHEY_SIMPLEX,
+                0.8,
+                Scalar(0,255,0),
+                2
         );
 
-
     }
-
-
-
-
-
-    //-----------------------------
-    //左上角信息
-    //-----------------------------
-
-
-    putText(
-        result,
-        "Cracks: "+
-        to_string(cracks.size()),
-        Point(40,60),
-        FONT_HERSHEY_SIMPLEX,
-        1.5,
-        red,
-        3
-    );
-
-
-
-    putText(
-        result,
-        "Max Length: "+
-        to_string((int)maxLen)+" px",
-        Point(40,120),
-        FONT_HERSHEY_SIMPLEX,
-        1.5,
-        red,
-        3
-    );
-
 
 
 
@@ -482,36 +394,61 @@ int main()
 
     cout<<"===================="<<endl;
 
-    cout<<"裂纹数量:"
-        <<cracks.size()
-        <<endl;
+
+    cout
+    <<"裂纹数量:"
+    <<crackCount
+    <<endl;
 
 
-    cout<<"最长长度:"
-        <<maxLen
-        <<" px"
-        <<endl;
+    cout
+    <<"最长裂纹:"
+    <<maxLength
+    <<" pixels"
+    <<endl;
+
+
+
+
+
+
+
+    //==========================
+    //显示数量
+    //==========================
+
+
+    putText(
+            result,
+            "Cracks Detected: "
+            +to_string(crackCount),
+            Point(30,50),
+            FONT_HERSHEY_SIMPLEX,
+            1.2,
+            Scalar(0,255,0),
+            3
+    );
 
 
 
 
 
     imwrite(
-        "../question7/result7.png",
-        result
+            "result.png",
+            result
     );
 
 
 
     imshow(
-        "Crack Detection",
-        result
+            "Crack Result",
+            result
     );
+
+
 
     waitKey(0);
 
 
-
     return 0;
-
 }
